@@ -21,7 +21,10 @@ DEFAULT_CONFIG = {
     "critical_battery_threshold": 10,
     "vendor_id": None,  # Will be auto-detected
     "product_id": None,  # Will be auto-detected
-    "device_name": None  # Will be auto-detected
+    "device_name": None,  # Will be auto-detected
+    "report_id": None,  # Will be auto-detected
+    "left_battery_index": None,  # Will be auto-detected
+    "right_battery_index": None  # Will be auto-detected
 }
 
 # Ensure config directory exists
@@ -30,7 +33,7 @@ if not os.path.exists(CONFIG_DIR):
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
@@ -53,8 +56,10 @@ class NotificationSystem(ABC):
 
 class SystemTrayInterface(ABC):
     @abstractmethod
-    def create_tray_icon(self, icon_image, title, menu_items):
-        """Create a system tray icon"""
+    def create_tray_icon(self, icon_image, title, menu_items) -> bool:
+        """Create a system tray icon
+        returns True if successful, False otherwise
+        """
         pass
     
     @abstractmethod
@@ -434,9 +439,7 @@ class BatteryMonitor:
             # Filter for potential ZMK devices
             if ('keyboard' in product.lower() or 
                 'zmk' in product.lower() or 
-                'zmk' in manufacturer.lower() or
-                'chara' in manufacturer.lower() or
-                'gauntlet' in product.lower()):
+                'zmk' in manufacturer.lower()):
                 
                 zmk_candidates.append({
                     "vendor_id": device["vendor_id"],
@@ -464,8 +467,8 @@ class BatteryMonitor:
         """
         Read battery levels from ZMK keyboard
         
-        Based on analysis of Gauntlet-Gauge, ZMK keyboards use a HID feature report
-        to communicate battery levels. Report IDs may vary across keyboards.
+        ZMK keyboards use HID feature reports to communicate battery levels,
+        but report IDs and data structures vary across different keyboards.
         """
         left_battery = None
         right_battery = None
@@ -476,40 +479,95 @@ class BatteryMonitor:
             device = hid.device()
             device.open(self.config["vendor_id"], self.config["product_id"])
             
-            # Try specific report ID first (0x08 for CharaChorder Gauntlet)
-            report_id = 0x08
+            # First, try to find the correct report ID by scanning common IDs
+            report_ids = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+            valid_reports = {}
             
-            # Fetch the feature report
-            try:
-                report = device.get_feature_report(report_id, 64)
-                
-                if len(report) > 2:
-                    # Based on CharaChorder Gauntlet protocol:
-                    # - Battery level for left half is at index 1
-                    # - Battery level for right half is at index 2
-                    left_battery = report[1]
-                    right_battery = report[2]
+            for report_id in report_ids:
+                try:
+                    report = device.get_feature_report(report_id, 64)
+                    logger.debug(f"Report ID 0x{report_id:02x}: {[hex(b) for b in report]}")
                     
+                    # Store reports that have data (longer than just the report ID itself)
+                    if len(report) > 2:
+                        valid_reports[report_id] = report
+                except Exception as e:
+                    logger.debug(f"Report ID 0x{report_id:02x} not supported: {e}")
+            
+            # For ZMK keyboards, battery reports usually contain values between 0-100
+            # in the first few bytes after the report ID
+            for report_id, report in valid_reports.items():
+                # Check for potential battery values in the first 5 positions
+                potential_battery_values = []
+                for i in range(1, min(5, len(report))):
+                    if 0 <= report[i] <= 100:
+                        potential_battery_values.append((i, report[i]))
+                
+                if len(potential_battery_values) >= 2:
+                    # If we found at least 2 potential battery values, use the first two
+                    left_idx, left_battery = potential_battery_values[0]
+                    right_idx, right_battery = potential_battery_values[1]
+                    
+                    logger.info(f"Found battery levels in report ID 0x{report_id:02x} at positions {left_idx} and {right_idx}")
                     logger.info(f"Battery levels - Left: {left_battery}%, Right: {right_battery}%")
                     
-            except Exception as e:
-                logger.warning(f"Failed with report ID 0x08: {e}")
-                
-                # If the first attempt fails, try alternative report IDs
-                for alt_id in [0x01, 0x02, 0x03, 0x04]:
-                    try:
-                        report = device.get_feature_report(alt_id, 64)
-                        logger.debug(f"Report ID 0x{alt_id:02x}: {report}")
-                        # Look for potential battery values (typically 0-100)
-                        for i in range(1, min(5, len(report))):
-                            if 0 <= report[i] <= 100:
-                                if left_battery is None:
-                                    left_battery = report[i]
-                                elif right_battery is None:
-                                    right_battery = report[i]
-                    except:
-                        pass
+                    # Store the successful report ID in config for future use
+                    if self.config.get("report_id") != report_id:
+                        self.config["report_id"] = report_id
+                        self.config["left_battery_index"] = left_idx
+                        self.config["right_battery_index"] = right_idx
+                        self.save_config()
+                        logger.info(f"Updated config with report ID 0x{report_id:02x}")
+                    
+                    break
+                elif len(potential_battery_values) == 1:
+                    # If we only found one battery value, it might be for a single-sided keyboard
+                    # or the other half might be offline
+                    idx, value = potential_battery_values[0]
+                    left_battery = value
+                    logger.info(f"Found single battery level in report ID 0x{report_id:02x} at position {idx}")
+                    logger.info(f"Battery level - Left: {left_battery}%, Right: None (or not connected)")
+                    
+                    # Store the successful report ID in config
+                    if self.config.get("report_id") != report_id:
+                        self.config["report_id"] = report_id
+                        self.config["left_battery_index"] = idx
+                        self.config["right_battery_index"] = None
+                        self.save_config()
+                        logger.info(f"Updated config with report ID 0x{report_id:02x} (single battery)")
+                    
+                    break
             
+            # If we didn't find battery values but have previously working configuration,
+            # try using those stored values
+            if left_battery is None and right_battery is None and "report_id" in self.config:
+                try:
+                    report_id = self.config["report_id"]
+                    report = device.get_feature_report(report_id, 64)
+                    
+                    if self.config["left_battery_index"] is not None and self.config["left_battery_index"] < len(report):
+                        left_idx = self.config["left_battery_index"]
+                        if 0 <= report[left_idx] <= 100:
+                            left_battery = report[left_idx]
+                    
+                    if self.config["right_battery_index"] is not None and self.config["right_battery_index"] < len(report):
+                        right_idx = self.config["right_battery_index"]
+                        if 0 <= report[right_idx] <= 100:
+                            right_battery = report[right_idx]
+                    
+                    if left_battery is not None or right_battery is not None:
+                        logger.info(f"Using stored config with report ID 0x{report_id:02x}")
+                        logger.info(f"Battery levels - Left: {left_battery}%, Right: {right_battery}%")
+                except Exception as e:
+                    logger.warning(f"Failed to use stored report ID configuration: {e}")
+            
+            # If we still don't have battery levels, dump all reports for debugging
+            if left_battery is None and right_battery is None:
+                logger.warning("Could not detect battery levels automatically")
+                logger.debug("All detected reports:")
+                for report_id, report in valid_reports.items():
+                    logger.debug(f"Report ID 0x{report_id:02x}: {[hex(b) for b in report]}")
+                
             device.close()
             
         except Exception as e:
@@ -524,8 +582,8 @@ class BatteryMonitor:
         # Log to CSV file
         self.log_battery_levels()
         
-        return self.battery_levels
-    
+        return self.battery_levels    
+
     def log_battery_levels(self):
         """Log battery levels to CSV file"""
         if not os.path.exists(LOG_FILE):
