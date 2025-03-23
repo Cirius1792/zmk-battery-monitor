@@ -1,0 +1,11 @@
+[project]
+name = "zmk-battery-monitor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "hidapi>=0.14.0.post4",
+    "pillow>=11.1.0",
+    "pystray>=0.19.5",
+]
